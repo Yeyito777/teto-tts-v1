@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")" && pwd)
+RUN_DIR="$ROOT/.run"
+OUT_DIR="$ROOT/outputs"
+LLM_PID_FILE="$RUN_DIR/llm.pid"
+API_PID_FILE="$RUN_DIR/api.pid"
+LLM_LOG="$RUN_DIR/llm.log"
+API_LOG="$RUN_DIR/api.log"
+LLM_URL="http://127.0.0.1:8010/v1/models"
+API_HEALTH_URL="http://127.0.0.1:8011/health"
+API_TTS_URL="http://127.0.0.1:8011/v1/tts/file"
+PRESET_ID="jamie-spoken-for-20s-40s"
+MODEL_PATH="$ROOT/models/MioTTS-GGUF/MioTTS-0.1B-BF16.gguf"
+LLAMA_BIN="$ROOT/vendor/llamacpp/llama-server"
+PYTHON_BIN="$ROOT/.venv/bin/python"
+
+usage() {
+  cat <<'EOF'
+usage:
+  tts load
+  tts "things to say"
+  tts unload
+EOF
+}
+
+pid_from_file() {
+  local file=$1
+  [[ -f "$file" ]] || return 1
+  local pid
+  pid=$(<"$file") || return 1
+  [[ -n "$pid" ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+pid_alive() {
+  local file=$1
+  local pid
+  pid=$(pid_from_file "$file") || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+cleanup_stale_pid() {
+  local file=$1
+  if [[ -f "$file" ]] && ! pid_alive "$file"; then
+    rm -f "$file"
+  fi
+}
+
+any_loaded() {
+  cleanup_stale_pid "$LLM_PID_FILE"
+  cleanup_stale_pid "$API_PID_FILE"
+  pid_alive "$LLM_PID_FILE" || pid_alive "$API_PID_FILE"
+}
+
+fully_loaded() {
+  cleanup_stale_pid "$LLM_PID_FILE"
+  cleanup_stale_pid "$API_PID_FILE"
+  pid_alive "$LLM_PID_FILE" && pid_alive "$API_PID_FILE"
+}
+
+require_files() {
+  [[ -x "$LLAMA_BIN" ]] || { echo "missing llama-server: $LLAMA_BIN" >&2; exit 1; }
+  [[ -f "$MODEL_PATH" ]] || { echo "missing model: $MODEL_PATH" >&2; exit 1; }
+  [[ -x "$PYTHON_BIN" ]] || { echo "missing python env: $PYTHON_BIN" >&2; exit 1; }
+  [[ -f "$ROOT/refs/presets/$PRESET_ID.pt" ]] || { echo "missing preset: $ROOT/refs/presets/$PRESET_ID.pt" >&2; exit 1; }
+}
+
+wait_http_ok() {
+  local url=$1
+  local label=$2
+  for _ in $(seq 1 120); do
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "$label did not come up: $url" >&2
+  return 1
+}
+
+start_llm() {
+  mkdir -p "$RUN_DIR" "$OUT_DIR"
+  : > "$LLM_LOG"
+  (
+    export LD_LIBRARY_PATH="$ROOT/vendor/llamacpp:${LD_LIBRARY_PATH:-}"
+    exec nohup "$LLAMA_BIN" \
+      -m "$MODEL_PATH" \
+      -c 4096 \
+      --host 127.0.0.1 \
+      --port 8010 \
+      --batch-size 4 \
+      --threads 4 \
+      --n-gpu-layers 0 \
+      >"$LLM_LOG" 2>&1
+  ) &
+  echo $! > "$LLM_PID_FILE"
+  wait_http_ok "$LLM_URL" "llm"
+}
+
+start_api() {
+  : > "$API_LOG"
+  (
+    cd "$ROOT"
+    exec nohup "$PYTHON_BIN" run_server.py \
+      --host 127.0.0.1 \
+      --port 8011 \
+      --llm-base-url http://127.0.0.1:8010/v1 \
+      --device cpu \
+      --presets-dir "$ROOT/refs/presets" \
+      --log-level warning \
+      >"$API_LOG" 2>&1
+  ) &
+  echo $! > "$API_PID_FILE"
+  wait_http_ok "$API_HEALTH_URL" "api"
+}
+
+do_load() {
+  require_files
+  if any_loaded; then
+    echo "tts already loaded" >&2
+    exit 1
+  fi
+  start_llm
+  start_api
+  echo "tts loaded"
+}
+
+kill_pid_file() {
+  local file=$1
+  local name=$2
+  local pid
+  pid=$(pid_from_file "$file") || return 0
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$file"
+      return 0
+    fi
+    sleep 0.25
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  rm -f "$file"
+}
+
+do_unload() {
+  if ! any_loaded; then
+    echo "tts not loaded" >&2
+    exit 1
+  fi
+  kill_pid_file "$API_PID_FILE" api
+  kill_pid_file "$LLM_PID_FILE" llm
+  echo "tts unloaded"
+}
+
+speak_text() {
+  local text=$1
+  if ! fully_loaded; then
+    echo "tts not loaded" >&2
+    exit 1
+  fi
+  mkdir -p "$OUT_DIR"
+  local stamp out latest
+  stamp=$(date +%Y%m%d-%H%M%S)
+  out="$OUT_DIR/$stamp.wav"
+  latest="$OUT_DIR/latest.wav"
+  curl --fail-with-body -sS -X POST "$API_TTS_URL" \
+    -F "text=$text" \
+    -F "reference_preset_id=$PRESET_ID" \
+    -F "max_tokens=240" \
+    -F "output_format=wav" \
+    -o "$out"
+  (cd "$OUT_DIR" && ln -sfn "$(basename "$out")" "$(basename "$latest")")
+  echo "$out"
+  if command -v mpv >/dev/null 2>&1; then
+    mpv --really-quiet --no-video "$out"
+  fi
+}
+
+main() {
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
+  fi
+  case "$1" in
+    load)
+      [[ $# -eq 1 ]] || { usage; exit 1; }
+      do_load
+      ;;
+    unload)
+      [[ $# -eq 1 ]] || { usage; exit 1; }
+      do_unload
+      ;;
+    *)
+      [[ $# -eq 1 ]] || { usage; exit 1; }
+      speak_text "$1"
+      ;;
+  esac
+}
+
+main "$@"

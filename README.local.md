@@ -1,25 +1,21 @@
 # teto-tts-v1
 
-Local productionized MioTTS 0.1B CPU setup for a Teto-style voice.
+Canonical interface:
+- `./tts load`
+- `./tts "things to say"`
+- `./tts unload`
 
-What is included:
-- MioTTS-Inference app code
-- helper scripts to start the local CPU stack
-- ref-management scripts
-- project layout for refs, presets, models, and outputs
+Behavior:
+- `tts load` starts the local CPU stack in the background
+- `tts "..."` synthesizes with the hardcoded preset `jamie-spoken-for-20s-40s`, saves a wav under `outputs/`, and plays it with `mpv` if available
+- `tts unload` stops the background services
 
-What is intentionally not committed:
-- model weights
-- vendored llama.cpp binaries
-- virtualenv
-- generated outputs
-- copyrighted/audio reference assets
+Rules:
+- `load` fails if already loaded
+- speaking fails if not loaded
+- `unload` fails if not loaded
 
-Canonical local layout:
-- model: `models/MioTTS-GGUF/MioTTS-0.1B-BF16.gguf`
-- chosen ref: `refs/chosen-ref.wav`
-- chosen preset id: `jamie-spoken-for-20s-40s`
-
-Start locally:
-1. `scripts/start-llm-cpu.sh`
-2. `scripts/start-api-cpu.sh`
+Useful local assets:
+- chosen preset: `refs/presets/jamie-spoken-for-20s-40s.pt`
+- chosen ref wav: `refs/chosen-ref.wav`
+- extra ref material: `refs/candidates/`
