@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+.env
+.env.*
+
+# Runtime state
+.run/
+*.log
+*.pid
+
+# Large/local assets
+models/
+vendor/
+outputs/
+refs/chosen-ref.wav
+refs/presets/
+refs/candidates/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Keep lockfile for reproducibility
+# uv.lock is tracked
