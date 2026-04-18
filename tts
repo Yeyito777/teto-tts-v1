@@ -5,16 +5,17 @@ ROOT=$(cd "$(dirname "$0")" && pwd)
 RUN_DIR="$ROOT/.run"
 OUT_DIR="$ROOT/outputs"
 LLM_PID_FILE="$RUN_DIR/llm.pid"
-API_PID_FILE="$RUN_DIR/api.pid"
+WORKER_PID_FILE="$RUN_DIR/worker.pid"
 LLM_LOG="$RUN_DIR/llm.log"
-API_LOG="$RUN_DIR/api.log"
+WORKER_LOG="$RUN_DIR/worker.log"
+WORKER_SOCKET="$RUN_DIR/worker.sock"
 LLM_URL="http://127.0.0.1:8010/v1/models"
-API_HEALTH_URL="http://127.0.0.1:8011/health"
-API_TTS_URL="http://127.0.0.1:8011/v1/tts/file"
 PRESET_ID="jamie-spoken-for-20s-40s"
 MODEL_PATH="$ROOT/models/MioTTS-GGUF/MioTTS-0.1B-BF16.gguf"
 LLAMA_BIN="$ROOT/vendor/llamacpp/llama-server"
 PYTHON_BIN="$ROOT/.venv/bin/python"
+REQUEST_SCRIPT="$ROOT/scripts/tts_request.py"
+WORKER_SCRIPT="$ROOT/scripts/tts_worker.py"
 
 usage() {
   cat <<'EOF'
@@ -50,14 +51,14 @@ cleanup_stale_pid() {
 
 any_loaded() {
   cleanup_stale_pid "$LLM_PID_FILE"
-  cleanup_stale_pid "$API_PID_FILE"
-  pid_alive "$LLM_PID_FILE" || pid_alive "$API_PID_FILE"
+  cleanup_stale_pid "$WORKER_PID_FILE"
+  pid_alive "$LLM_PID_FILE" || pid_alive "$WORKER_PID_FILE"
 }
 
 fully_loaded() {
   cleanup_stale_pid "$LLM_PID_FILE"
-  cleanup_stale_pid "$API_PID_FILE"
-  pid_alive "$LLM_PID_FILE" && pid_alive "$API_PID_FILE"
+  cleanup_stale_pid "$WORKER_PID_FILE"
+  pid_alive "$LLM_PID_FILE" && pid_alive "$WORKER_PID_FILE"
 }
 
 require_files() {
@@ -65,6 +66,8 @@ require_files() {
   [[ -f "$MODEL_PATH" ]] || { echo "missing model: $MODEL_PATH" >&2; exit 1; }
   [[ -x "$PYTHON_BIN" ]] || { echo "missing python env: $PYTHON_BIN" >&2; exit 1; }
   [[ -f "$ROOT/refs/presets/$PRESET_ID.pt" ]] || { echo "missing preset: $ROOT/refs/presets/$PRESET_ID.pt" >&2; exit 1; }
+  [[ -f "$WORKER_SCRIPT" ]] || { echo "missing worker script: $WORKER_SCRIPT" >&2; exit 1; }
+  [[ -f "$REQUEST_SCRIPT" ]] || { echo "missing request script: $REQUEST_SCRIPT" >&2; exit 1; }
 }
 
 wait_http_ok() {
@@ -77,6 +80,17 @@ wait_http_ok() {
     sleep 0.5
   done
   echo "$label did not come up: $url" >&2
+  return 1
+}
+
+wait_worker_ok() {
+  for _ in $(seq 1 120); do
+    if "$PYTHON_BIN" "$REQUEST_SCRIPT" --socket "$WORKER_SOCKET" --ping >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "worker did not come up: $WORKER_SOCKET" >&2
   return 1
 }
 
@@ -99,21 +113,22 @@ start_llm() {
   wait_http_ok "$LLM_URL" "llm"
 }
 
-start_api() {
-  : > "$API_LOG"
+start_worker() {
+  : > "$WORKER_LOG"
+  rm -f "$WORKER_SOCKET"
   (
     cd "$ROOT"
-    exec nohup "$PYTHON_BIN" run_server.py \
-      --host 127.0.0.1 \
-      --port 8011 \
+    exec nohup "$PYTHON_BIN" "$WORKER_SCRIPT" \
+      --socket "$WORKER_SOCKET" \
       --llm-base-url http://127.0.0.1:8010/v1 \
       --device cpu \
       --presets-dir "$ROOT/refs/presets" \
+      --preset-id "$PRESET_ID" \
       --log-level warning \
-      >"$API_LOG" 2>&1
+      >"$WORKER_LOG" 2>&1
   ) &
-  echo $! > "$API_PID_FILE"
-  wait_http_ok "$API_HEALTH_URL" "api"
+  echo $! > "$WORKER_PID_FILE"
+  wait_worker_ok
 }
 
 do_load() {
@@ -123,13 +138,12 @@ do_load() {
     exit 1
   fi
   start_llm
-  start_api
+  start_worker
   echo "tts loaded"
 }
 
 kill_pid_file() {
   local file=$1
-  local name=$2
   local pid
   pid=$(pid_from_file "$file") || return 0
   kill "$pid" 2>/dev/null || true
@@ -149,8 +163,9 @@ do_unload() {
     echo "tts not loaded" >&2
     exit 1
   fi
-  kill_pid_file "$API_PID_FILE" api
-  kill_pid_file "$LLM_PID_FILE" llm
+  kill_pid_file "$WORKER_PID_FILE"
+  rm -f "$WORKER_SOCKET"
+  kill_pid_file "$LLM_PID_FILE"
   echo "tts unloaded"
 }
 
@@ -161,16 +176,11 @@ speak_text() {
     exit 1
   fi
   mkdir -p "$OUT_DIR"
-  local stamp out latest
+  local stamp out latest resp
   stamp=$(date +%Y%m%d-%H%M%S)
   out="$OUT_DIR/$stamp.wav"
   latest="$OUT_DIR/latest.wav"
-  curl --fail-with-body -sS -X POST "$API_TTS_URL" \
-    -F "text=$text" \
-    -F "reference_preset_id=$PRESET_ID" \
-    -F "max_tokens=240" \
-    -F "output_format=wav" \
-    -o "$out"
+  resp=$("$PYTHON_BIN" "$REQUEST_SCRIPT" --socket "$WORKER_SOCKET" --text "$text" --output "$out")
   (cd "$OUT_DIR" && ln -sfn "$(basename "$out")" "$(basename "$latest")")
   echo "$out"
   if command -v mpv >/dev/null 2>&1; then
