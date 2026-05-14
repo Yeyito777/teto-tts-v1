@@ -9,7 +9,7 @@ Canonical interface:
 
 Behavior:
 - `tts load` starts the local background services and keeps the model warm
-- `tts "..."` synthesizes with the hardcoded preset `jamie-spoken-for-20s-40s`
+- `tts "..."` synthesizes with the hardcoded preset `jamie-spoken-for-00s-20s`
 - `tts unload` stops the local services
 
 Outputs:

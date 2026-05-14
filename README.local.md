@@ -6,7 +6,7 @@ Use only these commands:
 - `./tts unload`
 
 The hardcoded production preset is:
-- `jamie-spoken-for-20s-40s`
+- `jamie-spoken-for-00s-20s`
 
 Useful local dirs:
 - `refs/presets/`
